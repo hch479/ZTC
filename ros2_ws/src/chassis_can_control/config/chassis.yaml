@@ -13,6 +13,8 @@ chassis_can_node:
     # Keep this false during commissioning. It prevents automatic parameter
     # writes when the ROS node starts.
     push_parameters_on_start: false
+    # 保留 CAN 工程的原有行为；串口主线默认启用 ekf。
+    odometry.mode: weighted
 
     # IMU data uses the same logical frames over CAN and serial transport.
     imu.frame_id: base_link

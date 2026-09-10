@@ -75,6 +75,20 @@ class ChassisCanNode(Node):
         self.declare_parameter("imu.fusion_weight", 0.85)
         self.declare_parameter("imu.timeout_s", 0.20)
 
+        # 模式和 EKF 噪声在启动时固定，避免运行中切换造成位姿/协方差跳变。
+        self.declare_parameter("odometry.mode", "ekf")
+        self._fusion_mode = str(self.get_parameter("odometry.mode").value)
+        if self._fusion_mode not in ("ekf", "weighted"):
+            raise ValueError("odometry.mode must be 'ekf' or 'weighted'")
+        ekf_values = {}
+        for name, default in vars(EkfConfig()).items():
+            self.declare_parameter("ekf." + name, default)
+            ekf_values[name] = float(self.get_parameter("ekf." + name).value)
+        self._ekf_odometry = EkfOdometry(EkfConfig(**ekf_values))
+        if (self._fusion_mode == "ekf"
+                and self.get_parameter("imu.frame_id").value != self.get_parameter("base_frame").value):
+            raise ValueError("EKF requires mapped IMU axes in base_frame")
+
         # 这些参数名称与 can_protocol.PARAMETER_IDS 完全一致。
         defaults = {
             "controller.left_kp": 3000.0,
@@ -159,6 +173,8 @@ class ChassisCanNode(Node):
         self._parameter_transfer_failed = False
 
         self._odom_publisher = self.create_publisher(Odometry, "odom", 20)
+        # 仅发布纯编码器观测，不发布第二条 odom->base_link TF。
+        self._raw_odom_publisher = self.create_publisher(Odometry, "wheel/odom_raw", 20)
         self._joint_publisher = self.create_publisher(JointState, "joint_states", 20)
         self._imu_publisher = self.create_publisher(Imu, "imu/data_raw", 20)
         self._diagnostic_publisher = self.create_publisher(
@@ -341,9 +357,7 @@ class ChassisCanNode(Node):
                     self.get_logger().warning(
                         "STM32 restart detected; encoder odometry baseline reset"
                     )
-                    self._odometry.reset()
-                    self._last_odometry_sequence = None
-                    self._last_odometry_update_time = None
+                    self._reset_local_odometry()
                     self._latest_imu_acceleration = None
                     self._latest_imu_gyroscope = None
                     self._latest_imu_status = None
@@ -426,6 +440,8 @@ class ChassisCanNode(Node):
         self._latest_gyro_z_radps = angular_velocity[2]
         self._last_imu_time = time.monotonic()
         self._last_published_imu_sequence = acceleration.sequence
+        if self._fusion_mode == "ekf" and bool(self.get_parameter("imu.fusion_enabled").value):
+            self._ekf_odometry.add_imu(self._latest_gyro_z_radps, self._last_imu_time)
 
     def _update_odometry_if_pair_ready(self) -> None:
         left = self._left_encoder
@@ -442,6 +458,13 @@ class ChassisCanNode(Node):
         )
         wheel_track = float(self.get_parameter("geometry.wheel_track_m").value)
         now = time.monotonic()
+        if self._fusion_mode == "ekf":
+            sample = self._ekf_odometry.update(
+                left.total_count, right.total_count, diameter, counts_per_rev, wheel_track, now)
+            self._imu_fusion_active = self._ekf_imu_active(now)
+            if sample is not None:
+                self._publish_odometry_and_joints(sample)
+            return
         dt_s = None
         if self._last_odometry_update_time is not None:
             dt_s = now - self._last_odometry_update_time
@@ -490,7 +513,14 @@ class ChassisCanNode(Node):
         odom.pose.pose.position.y = sample.y_m
         odom.pose.pose.orientation.z = quaternion_z
         odom.pose.pose.orientation.w = quaternion_w
-        if self._latest_speed is not None:
+        if self._fusion_mode == "ekf":
+            odom.twist.twist.linear.x = self._ekf_odometry.filter.state[3]
+            odom.twist.twist.angular.z = self._ekf_odometry.filter.state[4]
+            pose_covariance, twist_covariance = self._ekf_odometry.ros_covariances()
+            odom.pose.covariance = pose_covariance
+            odom.twist.covariance = twist_covariance
+            self._publish_raw_wheel_odometry(stamp, odom_frame, base_frame)
+        elif self._latest_speed is not None:
             odom.twist.twist.linear.x = 0.5 * (
                 self._latest_speed.left_measured_mps
                 + self._latest_speed.right_measured_mps
@@ -539,6 +569,47 @@ class ChassisCanNode(Node):
             transform.transform.rotation.z = quaternion_z
             transform.transform.rotation.w = quaternion_w
             self._tf_broadcaster.sendTransform(transform)
+
+    def _publish_raw_wheel_odometry(self, stamp, odom_frame, base_frame):
+        """EKF 模式下的对照话题。位置不进入本节点 EKF，速度来自累计计数差。"""
+        raw = self._ekf_odometry.raw.sample()
+        message = Odometry()
+        message.header.stamp = stamp
+        message.header.frame_id = odom_frame
+        message.child_frame_id = base_frame
+        message.pose.pose.position.x = raw.x_m
+        message.pose.pose.position.y = raw.y_m
+        message.pose.pose.orientation.z = math.sin(raw.yaw_rad / 2.0)
+        message.pose.pose.orientation.w = math.cos(raw.yaw_rad / 2.0)
+        message.twist.twist.linear.x = self._ekf_odometry.raw_speed
+        message.twist.twist.angular.z = self._ekf_odometry.raw_rate
+        # raw 积分未传播位姿协方差，不向其他滤波器宣称精确位置。
+        for i in range(6):
+            message.pose.covariance[i * 6 + i] = 1e6
+            message.twist.covariance[i * 6 + i] = 1e6
+        if self._ekf_odometry.raw_velocity_valid:
+            config = self._ekf_odometry.filter.config
+            message.twist.covariance[0] = config.wheel_speed_stddev ** 2
+            message.twist.covariance[35] = config.wheel_yaw_rate_stddev ** 2
+        self._raw_odom_publisher.publish(message)
+
+    def _ekf_imu_active(self, now):
+        accepted_time = self._ekf_odometry.last_accepted_gyro_time
+        return bool(
+            self.get_parameter("imu.fusion_enabled").value
+            and self._latest_imu_status is not None
+            and self._latest_imu_status.calibrated
+            and accepted_time is not None
+            and now - accepted_time <= float(self.get_parameter("imu.timeout_s").value))
+
+    def _reset_local_odometry(self):
+        """滤波器、计数配对和 IMU 接受状态一起重置，防止重用旧样本。"""
+        self._odometry.reset()
+        self._ekf_odometry.reset()
+        self._left_encoder = self._right_encoder = None
+        self._last_odometry_sequence = None
+        self._last_odometry_update_time = None
+        self._imu_fusion_active = False
 
     def _publish_motor_debug(self) -> None:
         if self._latest_speed is None or self._latest_output is None:
@@ -620,6 +691,8 @@ class ChassisCanNode(Node):
         )
 
         imu_age = time.monotonic() - self._last_imu_time
+        if self._fusion_mode == "ekf":
+            self._imu_fusion_active = self._ekf_imu_active(time.monotonic())
         sensor_names = {0: "NONE", 1: "MPU6050", 2: "ICM20948"}
         if self._latest_imu_status is None:
             imu_sensor = "UNKNOWN"
@@ -639,6 +712,7 @@ class ChassisCanNode(Node):
         status.values.extend(
             [
                 KeyValue(key="imu_sensor", value=imu_sensor),
+                KeyValue(key="odometry_mode", value=self._fusion_mode),
                 KeyValue(key="imu_calibrated", value=str(imu_calibrated)),
                 KeyValue(key="imu_calibration", value=calibration_progress),
                 KeyValue(key="imu_data_age", value=f"{imu_age:.3f} s"),
@@ -647,6 +721,22 @@ class ChassisCanNode(Node):
                 ),
             ]
         )
+
+        if self._fusion_mode == "ekf":
+            ekf = self._ekf_odometry.filter
+            wheel_time = self._ekf_odometry.last_wheel_time
+            wheel_age = float('inf') if wheel_time is None else time.monotonic() - wheel_time
+            status.values.extend([
+                KeyValue(key="ekf_rejected_wheel", value=str(ekf.rejected_wheel)),
+                KeyValue(key="ekf_rejected_imu", value=str(ekf.rejected_imu)),
+                KeyValue(key="ekf_gap_count", value=str(ekf.gap_count)),
+                KeyValue(key="ekf_last_nis", value=str(ekf.last_nis)),
+                KeyValue(key="ekf_wheel_accepted", value=str(self._ekf_odometry.wheel_accepted)),
+                KeyValue(key="ekf_wheel_age_s", value=str(wheel_age)),
+            ])
+            if (not self._ekf_odometry.wheel_accepted or wheel_age > ekf.config.max_gap_s) and status.level < DiagnosticStatus.WARN:
+                status.level = DiagnosticStatus.WARN
+                status.message = "EKF awaiting valid wheel observation"
 
         # IMU problems must be visible, but they never stop motor control.
         if bool(self.get_parameter("imu.fusion_enabled").value):
@@ -657,7 +747,9 @@ class ChassisCanNode(Node):
             elif not imu_calibrated:
                 imu_problem = "IMU calibrating; keep chassis still"
             elif imu_age > imu_timeout:
-                imu_problem = "IMU data stale; wheel odometry fallback active"
+                imu_problem = "IMU data stale; wheel-only updates active"
+            elif self._fusion_mode == "ekf" and not self._imu_fusion_active:
+                imu_problem = "EKF awaiting accepted IMU observation"
             if imu_problem is not None and status.level < DiagnosticStatus.WARN:
                 status.level = DiagnosticStatus.WARN
                 status.message = imu_problem
@@ -838,6 +930,16 @@ class ChassisCanNode(Node):
             "push_parameters_on_start",
         }
         for parameter in parameters:
+            ekf_restart = self._fusion_mode == "ekf" and parameter.name in {
+                "geometry.wheel_diameter_m", "geometry.wheel_track_m",
+                "geometry.counts_per_wheel_rev", "imu.frame_id",
+                "imu.x_source", "imu.y_source", "imu.z_source",
+                "imu.x_sign", "imu.y_sign", "imu.z_sign",
+                "imu.accel_lsb_per_g", "imu.gyro_lsb_per_dps",
+            }
+            if parameter.name == "odometry.mode" or parameter.name.startswith("ekf.") or ekf_restart:
+                return SetParametersResult(
+                    successful=False, reason=f"edit YAML and restart node to change {parameter.name}")
             if parameter.name in restart_required:
                 return SetParametersResult(
                     successful=False,
@@ -951,9 +1053,7 @@ class ChassisCanNode(Node):
             )
         )
         if sent:
-            self._odometry.reset()
-            self._last_odometry_sequence = None
-            self._last_odometry_update_time = None
+            self._reset_local_odometry()
         response.success = sent
         response.message = "odometry reset command sent" if sent else "CAN unavailable"
         return response

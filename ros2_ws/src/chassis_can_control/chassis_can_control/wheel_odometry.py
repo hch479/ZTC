@@ -36,6 +36,11 @@ class WheelOdometry:
         """计算 int32 累计计数差，同时正确处理 0x7FFFFFFF 附近的环绕。"""
         return ((current - previous + (1 << 31)) % (1 << 32)) - (1 << 31)
 
+    def set_count_baseline(self, left_count: int, right_count: int) -> None:
+        """中断/计数跳变后只重建基准，保留已知位姿和轮角。"""
+        self._previous_left_count = left_count
+        self._previous_right_count = right_count
+
     def update(
         self,
         left_count: int,
