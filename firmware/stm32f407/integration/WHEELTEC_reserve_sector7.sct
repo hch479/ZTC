@@ -1,0 +1,17 @@
+; STM32F407VE: 512 KiB Flash, 128 KiB main SRAM region.
+; Application: sectors 0..6, 0x08000000..0x0805FFFF (384 KiB).
+; Parameters:  sector 7,    0x08060000..0x0807FFFF (128 KiB).
+;
+; 在 Keil Linker 中使用此 scatter file，防止程序覆盖参数扇区。
+
+LR_IROM1 0x08000000 0x00060000  {
+  ER_IROM1 0x08000000 0x00060000  {
+    *.o (RESET, +First)
+    *(InRoot$$Sections)
+    .ANY (+RO)
+  }
+  RW_IRAM1 0x20000000 0x00020000  {
+    .ANY (+RW +ZI)
+  }
+}
+

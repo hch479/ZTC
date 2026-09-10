@@ -1,0 +1,66 @@
+chassis_can_node:
+  ros__parameters:
+    # The C30D firmware and RDK can0 both use classic CAN at 1 Mbit/s.
+    can_interface: can0
+    command_rate_hz: 50.0
+    ros_command_timeout_s: 0.20
+    publish_tf: true
+    odom_frame: odom
+    base_frame: base_link
+    left_joint_name: left_wheel_joint
+    right_joint_name: right_wheel_joint
+
+    # Keep this false during commissioning. It prevents automatic parameter
+    # writes when the ROS node starts.
+    push_parameters_on_start: false
+
+    # IMU data uses the same logical frames over CAN and serial transport.
+    imu.frame_id: base_link
+    imu.accel_lsb_per_g: 16384.0
+    imu.gyro_lsb_per_dps: 65.5
+    imu.x_source: 0
+    imu.y_source: 1
+    imu.z_source: 2
+    imu.x_sign: 1.0
+    imu.y_sign: 1.0
+    imu.z_sign: 1.0
+    imu.angular_velocity_stddev: 0.02
+    imu.linear_acceleration_stddev: 0.15
+    imu.fusion_enabled: true
+    imu.fusion_weight: 0.85
+    imu.timeout_s: 0.20
+
+    controller.left_kp: 3000.0
+    controller.left_ki: 1500.0
+    controller.left_kff: 9000.0
+    controller.right_kp: 3000.0
+    controller.right_ki: 1500.0
+    controller.right_kff: 9000.0
+    controller.left_dead_forward: 700.0
+    controller.left_dead_reverse: 700.0
+    controller.right_dead_forward: 700.0
+    controller.right_dead_reverse: 700.0
+    controller.filter_alpha: 0.35
+    controller.straight_sync_kp: 0.40
+    controller.straight_sync_max_mps: 0.08
+
+    # 1 = Ackermann steering (R550 Mini); 0 = differential drive.
+    geometry.chassis_type: 1.0
+    geometry.wheel_diameter_m: 0.065
+    geometry.wheel_track_m: 0.162
+    geometry.wheelbase_m: 0.144
+    geometry.counts_per_wheel_rev: 60000.0
+    geometry.maximum_steering_angle_rad: 0.52
+    geometry.servo_center_pwm: 1500.0
+    geometry.servo_pwm_per_rad: 636.56
+
+    limits.maximum_linear_speed_mps: 0.60
+    limits.acceleration_mps2: 0.50
+    limits.deceleration_mps2: 0.80
+
+    safety.command_timeout_ms: 200.0
+    safety.low_battery_mv: 9800.0
+    safety.stall_target_speed_mps: 0.15
+    safety.stall_measured_speed_mps: 0.02
+    safety.stall_pwm_ratio: 0.80
+    safety.stall_time_ms: 600.0

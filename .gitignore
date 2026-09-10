@@ -1,0 +1,59 @@
+# Build products (STM32, ROS 2 and host tests)
+build/
+install/
+log/
+OBJ*/
+obj/
+Listings/
+Objects/
+*.o
+*.obj
+*.d
+*.crf
+*.dep
+*.axf
+*.elf
+*.hex
+*.map
+*.lnp
+*.htm
+*.build_log.htm
+*.exe
+*.log
+
+# Python caches and local environments
+__pycache__/
+*.py[cod]
+.pytest_cache/
+.venv/
+venv/
+*.egg-info/
+
+# Machine-specific editor state; keep uvprojx and uvoptx
+*.uvguix.*
+*.uvgui.*
+*.uvprojx.bak
+*.uvoptx.bak
+*.bak
+*.tmp
+*.swp
+.vscode/
+.idea/
+Thumbs.db
+.DS_Store
+
+# Private handoff materials and reproducible/generated copies
+/hardware_backups/
+/historical_builds/
+/reference_materials/
+/SHA256SUMS.csv
+/releases/
+/environment_check_*/
+tmp/
+
+# Local credentials
+.env
+.env.*
+!.env.example
+*.key
+*.pem

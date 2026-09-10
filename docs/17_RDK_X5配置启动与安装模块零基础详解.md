@@ -1,0 +1,1802 @@
+# RDK X5 上位机“配置、安装与启动模块”零基础详解
+
+## 1. 这个模块究竟负责什么
+
+你已经大致理解了上位机前 7 个模块：
+
+1. ROS 2 主节点；
+2. 速度命令处理；
+3. 协议编解码；
+4. 串口传输；
+5. 编码器里程计；
+6. 状态与调试数据；
+7. ROS 服务和参数管理。
+
+第 8 个“配置、安装与启动模块”不直接计算电机 PWM，也不直接解析串口字节。它解决的是另外一组问题：
+
+```text
+ROS 2 怎样知道这个功能包存在？
+这个 Python 包依赖哪些 ROS 组件？
+哪个 Python 函数是程序入口？
+Python 文件应该安装到哪里？
+launch 和 YAML 怎样进入 install 目录？
+启动时加载哪份 YAML？
+怎样一次启动节点并传入参数？
+新终端为什么要 source？
+修改代码后为什么要 colcon build？
+怎样安全启动和安全停止？
+```
+
+可以把前 7 个模块看成一台机器内部的零件，第 8 个模块则负责：
+
+```text
+登记零件 → 安装零件 → 配置零件 → 接好电源 → 按正确顺序开机
+```
+
+当前第 8 模块的主要文件是：
+
+```text
+chassis_can_control/
+├── package.xml
+├── setup.py
+├── setup.cfg
+├── resource/chassis_can_control
+├── chassis_can_control/__init__.py
+├── config/chassis_serial.yaml
+├── launch/chassis_serial.launch.py
+├── scripts/start_chassis_serial_safe.sh
+└── scripts/stop_chassis_serial_safe.sh
+```
+
+## 2. 先看完整执行链
+
+从源码到节点真正运行，会经过下面这条链：
+
+```text
+源码目录 src/chassis_can_control
+        │
+        │ colcon build
+        ↓
+colcon 读取 package.xml
+        │ 知道包名、构建类型和依赖
+        ↓
+ament_python 调用 setup.py
+        │
+        ├─安装 Python 模块
+        ├─生成 chassis_can_node 可执行入口
+        ├─复制 package.xml
+        ├─复制 launch 文件
+        └─复制 YAML 文件
+        ↓
+工作空间 install/chassis_can_control
+        │
+        │ source install/setup.bash
+        ↓
+当前终端能够找到这个包
+        │
+        │ ros2 launch ... chassis_serial.launch.py
+        ↓
+launch 找到安装后的 chassis_serial.yaml
+        │
+        │ 创建 Node 动作
+        ↓
+运行 setup.py 生成的 chassis_can_node 入口
+        │
+        ↓
+调用 chassis_can_control/chassis_can_node.py:main()
+        │
+        ↓
+创建 ChassisCanNode 对象
+        │
+        ├─YAML 参数进入第 1、2、4、5、6、7 模块
+        ├─打开 0002 串口
+        ├─创建话题、服务、定时器
+        └─进入 rclpy.spin() 事件循环
+```
+
+这条链中的任何一环断掉，都会出现不同错误。例如：
+
+- 没有编译：ROS 找不到包；
+- 没有 source：当前终端不知道包在哪里；
+- `setup.py` 没定义入口：ROS 找不到可执行程序；
+- launch 没安装：`ros2 launch` 找不到 launch 文件；
+- YAML 节点名不匹配：节点启动了，但参数没有加载；
+- 串口路径错误：节点存在，但收不到 STM32 心跳。
+
+## 3. ROS 2 工作空间是什么
+
+当前 RDK 工作空间：
+
+```text
+/home/wheeltec/chassis_project/ros2_ws
+```
+
+简称：
+
+```text
+~/chassis_project/ros2_ws
+```
+
+其中 `~` 代表当前用户的主目录：
+
+```text
+~ = /home/wheeltec
+```
+
+工作空间的典型结构：
+
+```text
+ros2_ws/
+├── src/       你编辑的源码
+├── build/     构建中间文件
+├── install/   构建完成后的安装结果
+└── log/       构建日志
+```
+
+### 3.1 `src` 目录
+
+源码功能包位于：
+
+```text
+~/chassis_project/ros2_ws/src/chassis_can_control
+```
+
+你修改 Python、YAML、launch 等文件，通常都是修改这里。
+
+### 3.2 `build` 目录
+
+`colcon build` 运行时使用的中间目录。一般不需要手工编辑。
+
+### 3.3 `install` 目录
+
+ROS 2 真正查找功能包、可执行入口、launch 和 YAML 的地方。
+
+本项目构建后大致会出现：
+
+```text
+install/chassis_can_control/
+├── lib/
+│   ├── python.../site-packages/chassis_can_control/
+│   └── chassis_can_control/chassis_can_node
+└── share/chassis_can_control/
+    ├── package.xml
+    ├── launch/chassis_serial.launch.py
+    └── config/chassis_serial.yaml
+```
+
+具体 Python 版本目录名称可能不同，但逻辑相同。
+
+### 3.4 `log` 目录
+
+`colcon` 的构建输出和错误记录。编译失败时可以查看：
+
+```bash
+ls -lt ~/chassis_project/ros2_ws/log/ | head
+```
+
+## 4. “Python 不用编译”，为什么仍要 `colcon build`
+
+Python 通常不需要像 C 那样编译为机器码。但 ROS 2 Python 功能包仍需要“构建/安装”过程，因为要完成：
+
+1. 读取功能包元数据；
+2. 检查构建类型；
+3. 安装 Python 包；
+4. 生成命令行可执行入口；
+5. 把包登记到 ament 索引；
+6. 安装 launch；
+7. 安装 YAML；
+8. 生成当前工作空间的 `setup.bash`。
+
+因此这里的 `colcon build` 更接近：
+
+```text
+整理 + 安装 + 登记 + 生成入口
+```
+
+而不是 STM32 那种把 C 语言编译为固件机器码。
+
+## 5. `package.xml`：功能包身份证和依赖清单
+
+文件：
+
+```text
+src/chassis_can_control/package.xml
+```
+
+它是 XML 格式。XML 用成对标签表达数据：
+
+```xml
+<name>chassis_can_control</name>
+```
+
+开始标签是 `<name>`，结束标签是 `</name>`，中间是值。
+
+### 5.1 文件头
+
+```xml
+<?xml version="1.0"?>
+<package format="3">
+```
+
+- 第一行声明 XML 版本；
+- `package format="3"` 表示使用 ROS 2 常见的 package manifest 第 3 版格式；
+- 最后必须有对应的 `</package>`。
+
+### 5.2 包名
+
+```xml
+<name>chassis_can_control</name>
+```
+
+这个名字非常重要。它需要与多个地方一致：
+
+```text
+package.xml 的 <name>
+setup.py 的 package_name
+ros2 launch 的包名
+launch Node(package=...)
+ament 索引 marker 文件名
+```
+
+当前都使用：
+
+```text
+chassis_can_control
+```
+
+如果只改其中一处，ROS 可能找不到包或可执行程序。
+
+### 5.3 版本、描述、维护者和许可证
+
+```xml
+<version>1.0.0</version>
+<description>...</description>
+<maintainer email="user@example.com">user</maintainer>
+<license>MIT</license>
+```
+
+这些是项目元信息：
+
+- `version`：软件版本；
+- `description`：包的用途；
+- `maintainer`：维护者；
+- `license`：许可证。
+
+它们通常不决定电机是否转动，但正式发布和依赖管理需要这些信息。
+
+### 5.4 构建工具依赖
+
+```xml
+<buildtool_depend>ament_python</buildtool_depend>
+```
+
+表示这是一个 ROS 2 Python 包，构建时使用 `ament_python`。
+
+它和文件末尾呼应：
+
+```xml
+<export>
+  <build_type>ament_python</build_type>
+</export>
+```
+
+`colcon` 看到后就知道应该按 Python 包方式处理，而不是用 CMake 编译 C++。
+
+### 5.5 运行依赖
+
+```xml
+<exec_depend>rclpy</exec_depend>
+```
+
+`exec_depend` 表示程序运行时需要的包。
+
+本项目依赖与代码模块的对应关系如下。
+
+| 依赖 | 在代码中的用途 | 关联模块 |
+|---|---|---|
+| `rclpy` | Python ROS 2 节点、发布、订阅、服务、参数、定时器 | 主节点及几乎全部模块 |
+| `rcl_interfaces` | `SetParametersResult`，参数修改校验结果 | 第 7 模块 |
+| `geometry_msgs` | `Twist`、`TransformStamped` | 第 2、5、6 模块 |
+| `nav_msgs` | `Odometry` | 第 5、6 模块 |
+| `sensor_msgs` | `JointState` | 第 5、6 模块 |
+| `std_msgs` | `Float32MultiArray` | 第 6 模块 `/motor/debug` |
+| `std_srvs` | `SetBool`、`Trigger` 服务 | 第 7 模块 |
+| `diagnostic_msgs` | `DiagnosticArray` 等诊断消息 | 第 6 模块 |
+| `tf2_ros` | 发布 `odom → base_link` | 第 5、6 模块 |
+| `ament_index_python` | launch 查找已安装包目录 | 第 8 模块 |
+| `launch` | ROS 2 launch 核心 | 第 8 模块 |
+| `launch_ros` | launch 中的 ROS `Node` 动作 | 第 8 模块 |
+
+注意：`serial_transport.py` 使用的 `os`、`tty`、`termios` 是 Linux/Python 标准库，不需要写成 ROS `exec_depend`。
+
+### 5.6 测试依赖
+
+```xml
+<test_depend>ament_flake8</test_depend>
+<test_depend>ament_pep257</test_depend>
+<test_depend>python3-pytest</test_depend>
+```
+
+它们主要用于代码风格和单元测试，不是节点日常运行的必需部分。
+
+### 5.7 `package.xml` 不会自动安装系统软件
+
+它是声明，不是直接执行 `apt install` 的脚本。安装依赖通常交给 `rosdep`：
+
+```bash
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+解释：
+
+- `--from-paths src`：扫描 `src` 下的功能包；
+- `--ignore-src`：源码中已经有的包不再从系统安装；
+- `-r`：部分依赖失败时继续处理其他依赖；
+- `-y`：自动确认安装。
+
+当前 RDK 已安装 ROS Humble 和项目运行依赖，日常启动不需要每次执行 `rosdep install`。
+
+## 6. `setup.py`：Python 包的安装说明书
+
+文件：
+
+```text
+src/chassis_can_control/setup.py
+```
+
+`package.xml` 更偏向 ROS 生态的元数据；`setup.py` 告诉 Python 的 `setuptools` 具体怎样安装。
+
+### 6.1 导入工具
+
+```python
+from glob import glob
+from setuptools import find_packages, setup
+```
+
+解释：
+
+- `glob()`：按通配符查找多个文件；
+- `find_packages()`：寻找 Python 包目录；
+- `setup()`：执行安装配置。
+
+例如：
+
+```python
+glob("launch/*.launch.py")
+```
+
+会找到 launch 目录中所有以 `.launch.py` 结尾的文件。
+
+### 6.2 统一包名变量
+
+```python
+package_name = "chassis_can_control"
+```
+
+后续多处复用，避免重复手写时拼错。
+
+### 6.3 `name` 和 `version`
+
+```python
+name=package_name,
+version="1.0.0",
+```
+
+应与 `package.xml` 中的包名和版本保持一致。
+
+### 6.4 `packages=find_packages(...)`
+
+```python
+packages=find_packages(exclude=["test"]),
+```
+
+它会找到带有 `__init__.py` 的 Python 包目录，例如：
+
+```text
+chassis_can_control/
+├── __init__.py
+├── chassis_can_node.py
+├── can_protocol.py
+├── serial_transport.py
+└── wheel_odometry.py
+```
+
+这里有两个同名层级，初学时很容易混淆：
+
+```text
+外层 chassis_can_control/  ROS 功能包根目录
+内层 chassis_can_control/  Python import 包目录
+```
+
+所以代码可以使用：
+
+```python
+from . import can_protocol
+from .serial_transport import SerialTransport
+```
+
+开头的点表示“从当前 Python 包内部导入”。
+
+`exclude=["test"]` 表示测试目录不作为主 Python 包安装。
+
+### 6.5 `data_files` 为什么重要
+
+Python 模块由 `packages` 安装，但 XML、launch 和 YAML 不是 Python 模块，需要通过 `data_files` 单独安装。
+
+第一项：
+
+```python
+(
+    "share/ament_index/resource_index/packages",
+    ["resource/" + package_name],
+),
+```
+
+把空 marker 文件安装到 ament 资源索引。ROS 2 借此知道这个包已经安装。
+
+第二项：
+
+```python
+("share/" + package_name, ["package.xml"]),
+```
+
+安装包清单。
+
+第三项：
+
+```python
+(
+    "share/" + package_name + "/launch",
+    glob("launch/*.launch.py"),
+),
+```
+
+把 launch 文件安装到：
+
+```text
+install/chassis_can_control/share/chassis_can_control/launch/
+```
+
+第四项：
+
+```python
+(
+    "share/" + package_name + "/config",
+    glob("config/*.yaml"),
+),
+```
+
+安装 YAML 配置。
+
+如果漏掉 launch 的 `data_files`，可能出现：
+
+```text
+file 'chassis_serial.launch.py' was not found
+```
+
+如果漏掉 config，launch 能启动，但查找 YAML 时失败。
+
+### 6.6 为什么安全脚本没有安装到 `install`
+
+当前 `setup.py` 的 `data_files` 没有安装 `scripts/*.sh`。因此本项目从源码目录调用脚本：
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+而不是从 `install` 目录调用。
+
+这是当前工程的明确设计。Shell 脚本是人工操作入口，ROS 节点本身仍来自 `install`。
+
+### 6.7 `install_requires`
+
+```python
+install_requires=["setuptools"],
+```
+
+这是 Python 包层面的依赖。ROS 消息和 rclpy 等依赖主要由 `package.xml`/rosdep 管理。
+
+不要随意使用 `pip install rclpy` 替代系统 ROS 安装；ROS 2 Humble 的 Python 包通常由 Ubuntu apt 与 `/opt/ros/humble` 提供。
+
+### 6.8 `entry_points`：最关键的程序入口
+
+```python
+entry_points={
+    "console_scripts": [
+        "chassis_can_node = chassis_can_control.chassis_can_node:main",
+    ],
+},
+```
+
+把它拆开：
+
+```text
+chassis_can_node
+    =
+chassis_can_control.chassis_can_node
+    :
+main
+```
+
+含义：
+
+- 左边 `chassis_can_node`：安装后生成的可执行程序名；
+- `chassis_can_control`：内层 Python 包目录；
+- 第二个 `chassis_can_node`：`chassis_can_node.py` 文件；
+- `main`：该文件中的 `main()` 函数。
+
+因此 launch 中写：
+
+```python
+executable="chassis_can_node"
+```
+
+最终调用第 1 模块中的：
+
+```python
+def main(args=None):
+    rclpy.init(args=args)
+    node = ChassisCanNode()
+    rclpy.spin(node)
+```
+
+这就是第 8 模块连接第 1 模块的地方。
+
+## 7. `setup.cfg`：可执行入口安装位置
+
+文件内容：
+
+```ini
+[develop]
+script_dir=$base/lib/chassis_can_control
+[install]
+install_scripts=$base/lib/chassis_can_control
+```
+
+INI 格式使用 `[段名]` 分类。
+
+它要求 `console_scripts` 生成的程序安装到：
+
+```text
+安装前缀/lib/chassis_can_control/
+```
+
+ROS 2 按约定在：
+
+```text
+lib/包名/可执行程序
+```
+
+查找 Python 节点。
+
+因此构建后大致会有：
+
+```text
+install/chassis_can_control/lib/chassis_can_control/chassis_can_node
+```
+
+如果 `setup.cfg` 缺失或路径错误，包可能存在，但 `ros2 run`/launch 找不到可执行文件。
+
+## 8. `resource/chassis_can_control`：为什么是空文件
+
+这个文件内容为空是正常的。文件名本身就是标记：
+
+```text
+resource/chassis_can_control
+```
+
+`setup.py` 把它安装到 ament 资源索引。可以把资源索引想象成 ROS 2 的“已安装包目录表”。
+
+当 Python launch 调用：
+
+```python
+get_package_share_directory("chassis_can_control")
+```
+
+ament 索引就能找到：
+
+```text
+.../install/chassis_can_control/share/chassis_can_control
+```
+
+空文件没有业务代码，但不能因为空就随便删除。
+
+## 9. `__init__.py`：让目录成为 Python 包
+
+文件：
+
+```text
+chassis_can_control/__init__.py
+```
+
+它可以是空文件。其主要作用是明确这个目录是 Python 包，使 `find_packages()` 和相对导入正常工作。
+
+当前导入：
+
+```python
+from . import can_protocol as protocol
+from .serial_transport import SerialTransport
+from .wheel_odometry import WheelOdometry
+```
+
+都依赖这些文件属于同一个 Python 包。
+
+## 10. YAML：不改 Python 代码就能调整配置
+
+文件：
+
+```text
+config/chassis_serial.yaml
+```
+
+YAML 用缩进表达层级。缩进同样是语法，不能随意混用制表符。
+
+### 10.1 最外层节点名
+
+```yaml
+chassis_can_node:
+  ros__parameters:
+```
+
+`chassis_can_node` 必须与 launch 创建的节点名对应：
+
+```python
+name="chassis_can_node"
+```
+
+如果 YAML 写成另一个节点名，launch 仍可能启动节点，但这一段参数不会正确应用。节点会退回 Python 中的默认参数。
+
+### 10.2 `ros__parameters`
+
+这是 ROS 2 参数文件固定层级。下面的键值才会传给节点。
+
+例如：
+
+```yaml
+serial_baud_rate: 115200
+publish_tf: true
+```
+
+YAML 类型：
+
+```text
+115200      整数
+50.0        浮点数
+true/false  布尔值
+serial      字符串
+```
+
+### 10.3 Python 中必须先声明参数
+
+主节点中：
+
+```python
+self.declare_parameter("serial_baud_rate", 115200)
+```
+
+然后读取：
+
+```python
+int(self.get_parameter("serial_baud_rate").value)
+```
+
+关系是：
+
+```text
+Python declare_parameter 给默认值和允许的参数名
+YAML 在启动时提供实际配置值
+get_parameter 取得最终值
+```
+
+### 10.4 通信参数连接第 4 模块
+
+```yaml
+transport: serial
+serial_port: /dev/serial/by-id/usb-WCH.CN_USB_Single_Serial_0002-if00
+serial_baud_rate: 115200
+```
+
+主节点读取 `transport`：
+
+```python
+if transport == "serial":
+    self._can = SerialTransport(serial_port, baud_rate)
+```
+
+所以 YAML 决定第 4 模块使用哪个传输实现、打开哪个设备。
+
+`0002` 是底盘；`0001` 是雷达。这里配置错误会让节点读错设备。
+
+### 10.5 命令参数连接第 2 模块
+
+```yaml
+command_rate_hz: 50.0
+ros_command_timeout_s: 0.20
+```
+
+- `command_rate_hz` 决定 RDK 向 STM32 发送运动帧的频率；
+- `ros_command_timeout_s` 决定 `/cmd_vel` 多久没更新就失效。
+
+主节点据此创建定时器和判断命令新鲜度。
+
+### 10.6 里程计参数连接第 5 模块
+
+```yaml
+geometry.wheel_diameter_m: 0.065
+geometry.wheel_track_m: 0.162
+geometry.counts_per_wheel_rev: 60000.0
+```
+
+`wheel_odometry.py` 用它们把编码器计数转换为 `/odom`。
+
+这些参数同时还能下发给 STM32。因此上下位机必须保持一致，否则：
+
+- STM32 认为轮速是一个值；
+- RDK 里程计又按另一个几何值计算；
+- `/motor/debug` 和 `/odom` 会互相矛盾。
+
+### 10.7 坐标参数连接第 5、6 模块
+
+```yaml
+publish_tf: true
+odom_frame: odom
+base_frame: base_link
+left_joint_name: left_wheel_joint
+right_joint_name: right_wheel_joint
+```
+
+决定 `/odom`、TF 和 `/joint_states` 中使用的名称。
+
+### 10.8 控制和安全参数连接第 7 模块及下位机
+
+```yaml
+controller.left_kp: 3000.0
+limits.maximum_linear_speed_mps: 0.60
+safety.command_timeout_ms: 200.0
+```
+
+这些值先成为 RDK ROS 参数。只有执行参数下发，或把 `push_parameters_on_start` 设为 true，才会发送到 STM32。
+
+当前：
+
+```yaml
+push_parameters_on_start: false
+```
+
+这是安全选择：节点启动时不会自动覆盖 STM32 已保存参数。
+
+### 10.9 为什么当前不建议设为 true
+
+如果 YAML 中某个 PI、轮径或底盘类型写错，自动下发可能在每次启动时覆盖下位机 RAM 参数。因此当前采用：
+
+```text
+启动节点
+→ 先检查诊断
+→ 软件失能
+→ 人工请求 push_parameters
+→ 验证
+→ 最后才保存 Flash
+```
+
+## 11. launch 文件：启动编排器
+
+文件：
+
+```text
+launch/chassis_serial.launch.py
+```
+
+它本身也是 Python，但主要不是处理串口或计算里程计，而是描述“需要启动什么”。
+
+### 11.1 导入
+
+```python
+from ament_index_python.packages import get_package_share_directory
+from launch import LaunchDescription
+from launch_ros.actions import Node
+import os
+```
+
+对应作用：
+
+- `get_package_share_directory`：找安装后的包目录；
+- `LaunchDescription`：装载一组启动动作；
+- `Node`：描述一个 ROS 节点启动动作；
+- `os.path.join`：安全拼接路径。
+
+### 11.2 launch 固定入口函数
+
+```python
+def generate_launch_description() -> LaunchDescription:
+```
+
+ROS 2 launch 加载文件时会调用这个函数。函数必须返回 `LaunchDescription`。
+
+这不是节点的 `main()`；它只是生成启动方案。
+
+### 11.3 查找安装后的包目录
+
+```python
+package_directory = get_package_share_directory(
+    "chassis_can_control"
+)
+```
+
+注意它查的是已安装包，不是硬编码源码路径。这就是为什么需要：
+
+```text
+resource marker
+data_files
+colcon build
+source install/setup.bash
+```
+
+### 11.4 拼接参数路径
+
+```python
+parameter_file = os.path.join(
+    package_directory,
+    "config",
+    "chassis_serial.yaml",
+)
+```
+
+最终路径类似：
+
+```text
+/home/wheeltec/chassis_project/ros2_ws/install/
+chassis_can_control/share/chassis_can_control/
+config/chassis_serial.yaml
+```
+
+launch 不是直接读取 `src` 中的 YAML。
+
+### 11.5 Node 动作逐项解释
+
+```python
+Node(
+    package="chassis_can_control",
+    executable="chassis_can_node",
+    name="chassis_can_node",
+    output="screen",
+    parameters=[parameter_file],
+)
+```
+
+#### `package`
+
+从哪个 ROS 包找程序，对应 `package.xml/setup.py` 的包名。
+
+#### `executable`
+
+运行哪个可执行入口，对应 `setup.py` 的 `console_scripts` 左侧名称。
+
+#### `name`
+
+节点在 ROS 网络中的名称：
+
+```text
+/chassis_can_node
+```
+
+同时要和 YAML 最外层名称匹配。
+
+#### `output="screen"`
+
+节点日志显示到 launch 当前终端，并进入 ROS 日志系统。
+
+#### `parameters=[parameter_file]`
+
+把 YAML 作为参数来源传给节点。列表形式允许以后同时加载多份参数或字典覆盖。
+
+### 11.6 为什么使用 launch，而不是直接 `ros2 run`
+
+直接运行：
+
+```bash
+ros2 run chassis_can_control chassis_can_node
+```
+
+它能运行入口，但不会自动加载 `chassis_serial.yaml`。此时 Python 默认参数中 `transport` 默认是 `can`，很可能尝试打开 `can0`，而不是当前串口。
+
+当前正确启动方式是：
+
+```bash
+ros2 launch chassis_can_control chassis_serial.launch.py
+```
+
+launch 把“程序 + 节点名 + YAML”绑定在一起，减少漏参数风险。
+
+## 12. `colcon build` 到底做了什么
+
+当前命令：
+
+```bash
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select chassis_can_control
+```
+
+### 12.1 `cd`
+
+进入工作空间根目录。`colcon` 会从这里寻找 `src`。
+
+### 12.2 第一条 `source`
+
+```bash
+source /opt/ros/humble/setup.bash
+```
+
+加载系统安装的 ROS 2 Humble，使当前终端拥有 `ament_python`、ROS 消息、launch 等基础环境。
+
+### 12.3 `colcon build`
+
+`colcon` 是多包工作空间构建工具。它扫描 `src`，识别 `package.xml`，再调用对应构建系统。
+
+### 12.4 `--packages-select`
+
+```bash
+--packages-select chassis_can_control
+```
+
+只构建当前包，避免无关包增加时间或错误干扰。
+
+### 12.5 成功标志
+
+```text
+Summary: 1 package finished
+```
+
+如果显示 `failed` 或 `aborted`，就不能把本次构建视为成功。
+
+### 12.6 构建完成后再次 source
+
+```bash
+source install/setup.bash
+```
+
+让当前终端认识刚生成的工作空间。如果不 source，即使磁盘上已经有 `install`，当前 shell 的环境变量仍可能不知道它。
+
+## 13. `source` 为什么每个新终端都要执行
+
+Shell 环境变量属于各自进程。终端 A 中执行：
+
+```bash
+source install/setup.bash
+```
+
+不会自动修改后来打开的终端 B。
+
+可以理解为每个终端都有自己的一张“去哪里找程序”的路径表。`source` 是把 ROS 路径加入当前终端的表中。
+
+两个层次：
+
+```bash
+source /opt/ros/humble/setup.bash
+```
+
+加载系统 ROS，称为 underlay。
+
+```bash
+source ~/chassis_project/ros2_ws/install/setup.bash
+```
+
+在系统 ROS 上叠加自己的工作空间，称为 overlay。
+
+顺序不能颠倒：先系统 ROS，再项目工作空间。
+
+## 14. 修改不同文件后需要做什么
+
+| 修改内容 | 需要重新构建吗 | 需要重启节点吗 | 说明 |
+|---|---|---|---|
+| `chassis_can_node.py` | 是 | 是 | 安装后的 Python 包需要更新 |
+| `can_protocol.py` | 是 | 是 | 节点进程不会自动加载新源码 |
+| `serial_transport.py` | 是 | 是 | 串口对象创建于节点启动时 |
+| `wheel_odometry.py` | 是 | 是 | 运行中的 Python 已加载旧模块 |
+| `chassis_serial.yaml` | 是 | 是 | launch 读取 install 中的副本 |
+| `chassis_serial.launch.py` | 是 | 是 | launch 文件也安装到 install |
+| `setup.py` | 是 | 是 | 入口/安装规则变化 |
+| `package.xml` | 是 | 通常是 | 依赖或元数据变化 |
+| `start...sh` | 否 | 下次执行即可 | 当前从 src 直接运行脚本 |
+| `stop...sh` | 否 | 下次执行即可 | 当前从 src 直接运行脚本 |
+
+安全的修改流程：
+
+```bash
+# 1. 先软件失能并停止旧节点
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/stop_chassis_serial_safe.sh
+
+# 2. 进入工作空间并构建
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select chassis_can_control
+
+# 3. 加载新安装结果
+source install/setup.bash
+
+# 4. 安全启动
+bash src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+## 15. 安全启动脚本逐行解释
+
+文件：
+
+```text
+scripts/start_chassis_serial_safe.sh
+```
+
+### 15.1 解释器声明
+
+```bash
+#!/usr/bin/env bash
+```
+
+称为 shebang，表示使用环境中的 Bash 解释这个文件。
+
+即使如此，手工执行时仍推荐：
+
+```bash
+bash start_chassis_serial_safe.sh
+```
+
+不要使用 `sh`，因为 Ubuntu 的 `sh` 通常不是完整 Bash。
+
+### 15.2 严格错误处理
+
+```bash
+set -eo pipefail
+```
+
+含义：
+
+- `-e`：普通命令失败时停止脚本；
+- `pipefail`：管道中任何一步失败，整个管道视为失败。
+
+没有在这里立即使用 `-u`，因为 ROS Humble 的 `setup.bash` 会读取一些可能尚未定义的可选变量。
+
+### 15.3 定义工作空间
+
+```bash
+WORKSPACE="${HOME}/chassis_project/ros2_ws"
+```
+
+- `HOME` 是 `/home/wheeltec`；
+- `${...}` 是读取变量；
+- 双引号保护路径中的特殊字符和空格。
+
+最终：
+
+```text
+/home/wheeltec/chassis_project/ros2_ws
+```
+
+### 15.4 加载两个环境
+
+```bash
+source /opt/ros/humble/setup.bash
+source "${WORKSPACE}/install/setup.bash"
+```
+
+第一条加载系统 ROS，第二条加载本项目。
+
+如果没有成功构建，第二个文件可能不存在，脚本会因 `set -e` 停止，而不是带着错误环境继续启动。
+
+### 15.5 再开启未定义变量检查
+
+```bash
+set -u
+```
+
+以后脚本如果拼错变量名或读取未定义变量，会立即报错。它放在 `source` 后面，避免旧报错：
+
+```text
+AMENT_TRACE_SETUP_FILES: unbound variable
+```
+
+### 15.6 显示串口
+
+```bash
+ls -l /dev/serial/by-id/ 2>/dev/null || true
+```
+
+拆解：
+
+- `ls -l`：列出稳定串口名；
+- `2>/dev/null`：暂时不显示错误输出；
+- `|| true`：即使目录暂时不存在，也不让整个脚本在这里退出。
+
+这一步只是显示，不会自动替换 YAML 中的串口路径。
+
+### 15.7 `exec ros2 launch`
+
+```bash
+exec ros2 launch \
+    chassis_can_control \
+    chassis_serial.launch.py
+```
+
+实际文件写在一行，逻辑相同。
+
+`exec` 会让当前 Bash 进程被 `ros2 launch` 替换。好处是：
+
+- 信号直接交给 launch；
+- 按 `Ctrl+C` 更容易正常停止节点；
+- 不额外留下一个等待的 shell 层。
+
+launch 随后完成第 11 节所述的动作。
+
+### 15.8 为什么脚本不会自动使能电机
+
+脚本只执行 launch，没有调用：
+
+```bash
+ros2 service call /chassis/enable ... true
+```
+
+而第 1 模块初始化时：
+
+```python
+self._drive_enabled = False
+```
+
+所以每次新节点启动都默认软件失能。这是第 8 模块与第 1、2、7 模块共同形成的安全设计。
+
+## 16. 安全停止脚本逐行解释
+
+文件：
+
+```text
+scripts/stop_chassis_serial_safe.sh
+```
+
+### 16.1 加载 ROS 环境
+
+停止前也要调用 ROS 服务，所以同样需要：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/chassis_project/ros2_ws/install/setup.bash
+```
+
+这里先判断工作空间 setup 文件是否存在：
+
+```bash
+if [ -f ".../install/setup.bash" ]; then
+    source ".../install/setup.bash"
+fi
+```
+
+`-f` 表示检查普通文件是否存在。
+
+### 16.2 先请求软件失能
+
+```bash
+timeout 3 ros2 service call \
+    /chassis/enable \
+    std_srvs/srv/SetBool \
+    "{data: false}" \
+    >/dev/null 2>&1 || true
+```
+
+含义：
+
+- 调用第 7 模块的失能服务；
+- 最多等 3 秒；
+- 不在终端显示普通输出和错误；
+- 即使节点已不存在，也继续执行停止流程。
+
+为什么先失能再结束进程？因为优先通过正常控制路径向 STM32 下发 `enable=0` 和零速度。
+
+### 16.3 结束节点进程
+
+```bash
+pkill -f "chassis_can_control.*chassis_can_node" \
+    2>/dev/null || true
+```
+
+- `pkill`：按模式结束进程；
+- `-f`：匹配完整命令行；
+- 模式只针对本项目节点。
+
+节点的 `destroy_node()` 还会尽量再发送三次禁用命令并关闭串口。
+
+### 16.4 停止脚本与后台 launch
+
+当前脚本的主要目标是 `chassis_can_node`。结束子节点后 launch 通常会发现子进程退出并结束。执行后仍应检查：
+
+```bash
+pgrep -af 'chassis_serial.launch.py|chassis_can_node'
+```
+
+不要只根据终端显示一句 stopped 就假定所有后台进程都不存在。
+
+## 17. 前台启动和后台启动
+
+### 17.1 前台启动
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+特点：
+
+- 日志就在当前终端；
+- 终端被程序占用是正常的；
+- 按 `Ctrl+C` 停止；
+- 调试时最容易理解。
+
+### 17.2 后台启动
+
+当前机器曾使用：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/chassis_project/ros2_ws/install/setup.bash
+nohup ros2 launch chassis_can_control chassis_serial.launch.py \
+  > ~/chassis_project/chassis_serial.log 2>&1 </dev/null &
+```
+
+拆解：
+
+- `nohup`：SSH 断开后继续运行；
+- `>`：将正常输出写入日志；
+- `2>&1`：错误输出也写入同一个日志；
+- `</dev/null`：不再等待键盘输入；
+- `&`：放到后台。
+
+因此看不到启动窗口，不代表节点没有运行。
+
+查看：
+
+```bash
+pgrep -af 'chassis_serial.launch.py|chassis_can_node'
+ros2 node list
+tail -f ~/chassis_project/chassis_serial.log
+```
+
+### 17.3 为什么不能重复启动
+
+两个节点同时打开同一个串口设备时，Linux 可能允许两个进程都打开。接收到的字节可能被两个进程分别读走：
+
+```text
+节点 A 读到帧前半部分
+节点 B 读到帧后半部分
+两边都拼不出合法 15 字节帧
+```
+
+结果就是：
+
+```text
+STM32 heartbeat missing
+```
+
+每次启动前先执行：
+
+```bash
+pgrep -af 'chassis_serial.launch.py|chassis_can_node'
+```
+
+如果已经有一套 launch 和 node，就不要再次启动。
+
+## 18. 第一次安装到一台新 RDK 的完整流程
+
+这一节说明“全新安装”，不是日常启动步骤。
+
+### 18.1 确认系统 ROS
+
+```bash
+test -f /opt/ros/humble/setup.bash \
+  && echo ROS_HUMBLE_OK \
+  || echo ROS_HUMBLE_MISSING
+```
+
+如果输出 `ROS_HUMBLE_OK`，系统 ROS 环境存在。
+
+### 18.2 确认工具
+
+```bash
+which python3
+which colcon
+which ros2
+```
+
+`which` 显示命令来自哪个路径。
+
+如果 `colcon` 不存在，通常安装：
+
+```bash
+sudo apt update
+sudo apt install python3-colcon-common-extensions
+```
+
+不同 RDK 系统镜像的软件源可能不同；当前实机已经具备构建环境，不需要重复安装。
+
+### 18.3 建立工作空间
+
+```bash
+mkdir -p ~/chassis_project/ros2_ws/src
+```
+
+- `mkdir` 创建目录；
+- `-p` 允许一次创建多级目录，已存在也不报错。
+
+### 18.4 放入源码包
+
+最终必须是：
+
+```text
+~/chassis_project/ros2_ws/src/chassis_can_control/package.xml
+```
+
+常见错误是多套一层：
+
+```text
+src/chassis_can_control/chassis_can_control/package.xml
+```
+
+但要注意：内层同名 Python 包本来就应该存在。判断 ROS 包根目录以 `package.xml` 和 `setup.py` 所在层级为准。
+
+### 18.5 安装依赖
+
+```bash
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+rosdep install --from-paths src --ignore-src -r -y
+```
+
+### 18.6 构建
+
+```bash
+colcon build --packages-select chassis_can_control
+```
+
+### 18.7 加载并验证
+
+```bash
+source install/setup.bash
+ros2 pkg prefix chassis_can_control
+ros2 pkg executables chassis_can_control
+```
+
+应该能看到包路径和：
+
+```text
+chassis_can_control chassis_can_node
+```
+
+检查 launch：
+
+```bash
+ls install/chassis_can_control/share/chassis_can_control/launch/
+```
+
+检查 YAML：
+
+```bash
+ls install/chassis_can_control/share/chassis_can_control/config/
+```
+
+### 18.8 串口权限
+
+```bash
+ls -l /dev/serial/by-id/
+groups
+```
+
+如果用户不在 `dialout` 组：
+
+```bash
+sudo usermod -aG dialout wheeltec
+```
+
+然后退出登录并重新登录，组权限才更新。
+
+### 18.9 第一次启动
+
+必须架空车轮，然后：
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+新终端检查：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/chassis_project/ros2_ws/install/setup.bash
+ros2 topic echo --once /diagnostics
+```
+
+确认：
+
+```text
+IDLE
+NONE
+transport: serial
+heartbeat_age < 2 s
+```
+
+## 19. 日常启动流程与首次安装的区别
+
+日常开机不需要：
+
+```text
+apt install
+rosdep install
+复制源码
+colcon build
+```
+
+除非代码或配置发生变化。
+
+日常只需：
+
+```bash
+ssh wheeltec@RDK的IP
+pgrep -af 'chassis_serial.launch.py|chassis_can_node'
+ls -l /dev/serial/by-id/
+```
+
+若节点未运行：
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+若节点已经运行，不要重复启动，直接检查诊断。
+
+## 20. 从第 8 模块到其他 7 个模块的连接表
+
+| 第 8 模块内容 | 连接到哪个模块 | 连接方式 |
+|---|---|---|
+| `entry_points` | 第 1 主节点 | 调用 `chassis_can_node.py:main()` |
+| launch 的 `Node` | 第 1 主节点 | 创建 `/chassis_can_node` 进程 |
+| YAML `command_rate_hz` | 第 2 命令处理 | 决定运动帧定时器频率 |
+| YAML `ros_command_timeout_s` | 第 2 命令处理 | 判断 `/cmd_vel` 是否新鲜 |
+| `package.xml` 消息依赖 | 第 2、5、6、7 模块 | 提供 Twist、Odometry、服务等类型 |
+| YAML `transport/serial_*` | 第 4 串口模块 | 选择并创建 `SerialTransport` |
+| YAML `geometry.*` | 第 5 里程计 | 计数换距离和角度 |
+| YAML `publish_tf/frame` | 第 5、6 模块 | 决定 `/odom`、TF 和关节名称 |
+| YAML `controller/limits/safety` | 第 7 参数模块和 STM32 | 参数检查、下发和保存 |
+| `push_parameters_on_start` | 第 7 参数模块 | 决定启动时是否自动排队下发 |
+| 启动脚本 | 第 1 模块 | 加载环境并执行 launch |
+| 停止脚本 | 第 7、1 模块 | 先调用失能服务，再结束节点 |
+
+## 21. 常见故障按层定位
+
+### 21.1 `Package 'chassis_can_control' not found`
+
+问题位于安装/环境层，而不是串口协议。
+
+检查：
+
+```bash
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select chassis_can_control
+source install/setup.bash
+ros2 pkg prefix chassis_can_control
+```
+
+### 21.2 `executable 'chassis_can_node' not found`
+
+重点检查：
+
+- `setup.py` 的 `entry_points`；
+- `setup.cfg` 的安装路径；
+- 是否重新构建；
+- 是否 source 新的 `install/setup.bash`。
+
+验证：
+
+```bash
+ros2 pkg executables chassis_can_control
+```
+
+### 21.3 launch 文件找不到
+
+重点检查 `setup.py` 的：
+
+```python
+glob("launch/*.launch.py")
+```
+
+以及重新构建后的：
+
+```bash
+ls ~/chassis_project/ros2_ws/install/chassis_can_control/share/chassis_can_control/launch/
+```
+
+### 21.4 YAML 修改后没生效
+
+因为 launch 读的是 `install` 副本。执行：
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/stop_chassis_serial_safe.sh
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select chassis_can_control
+source install/setup.bash
+bash src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+### 21.5 节点启动却使用 CAN
+
+可能直接执行了：
+
+```bash
+ros2 run chassis_can_control chassis_can_node
+```
+
+而没有加载串口 YAML。改用：
+
+```bash
+ros2 launch chassis_can_control chassis_serial.launch.py
+```
+
+### 21.6 找不到 `0002` 串口
+
+这是硬件/设备配置层：
+
+```bash
+lsusb
+ls -l /dev/serial/by-id/
+```
+
+确认底盘供电和 USB 线，不要用雷达 `0001` 代替。
+
+### 21.7 节点存在但心跳丢失
+
+安装和启动已经至少部分成功，继续检查：
+
+```bash
+pgrep -af 'chassis_serial.launch.py|chassis_can_node'
+fuser -v /dev/serial/by-id/usb-WCH.CN_USB_Single_Serial_0002-if00
+```
+
+确认没有重复节点，再检查 STM32 供电、串口和固件协议。
+
+### 21.8 `AMENT_TRACE_SETUP_FILES: unbound variable`
+
+旧脚本在 source ROS 前执行了 `set -u`。当前脚本顺序已经修正：
+
+```text
+先 set -eo pipefail
+再 source ROS
+最后 set -u
+```
+
+请用当前安全脚本，不要复制旧版本。
+
+## 22. 怎样确认当前实际使用的是哪份文件
+
+查看包安装前缀：
+
+```bash
+ros2 pkg prefix chassis_can_control
+```
+
+查看安装后的 YAML：
+
+```bash
+cat ~/chassis_project/ros2_ws/install/chassis_can_control/share/chassis_can_control/config/chassis_serial.yaml
+```
+
+查看源码 YAML：
+
+```bash
+cat ~/chassis_project/ros2_ws/src/chassis_can_control/config/chassis_serial.yaml
+```
+
+比较：
+
+```bash
+diff \
+  ~/chassis_project/ros2_ws/src/chassis_can_control/config/chassis_serial.yaml \
+  ~/chassis_project/ros2_ws/install/chassis_can_control/share/chassis_can_control/config/chassis_serial.yaml
+```
+
+没有输出表示内容相同；有输出表示修改后可能尚未重新构建。
+
+查看运行进程使用的参数文件：
+
+```bash
+pgrep -af chassis_can_node
+```
+
+完整命令行中会显示类似：
+
+```text
+--params-file .../install/.../config/chassis_serial.yaml
+```
+
+## 23. 建议的学习实验
+
+这些实验不需要使能电机。
+
+### 实验一：看包是怎样被找到的
+
+新终端先不 source 工作空间，执行：
+
+```bash
+source /opt/ros/humble/setup.bash
+ros2 pkg prefix chassis_can_control
+```
+
+如果找不到，再执行：
+
+```bash
+source ~/chassis_project/ros2_ws/install/setup.bash
+ros2 pkg prefix chassis_can_control
+```
+
+观察 overlay 对搜索路径的影响。
+
+### 实验二：找 console script
+
+```bash
+ros2 pkg executables chassis_can_control
+```
+
+再查看：
+
+```bash
+ls -l ~/chassis_project/ros2_ws/install/chassis_can_control/lib/chassis_can_control/
+```
+
+### 实验三：比较源码与 install YAML
+
+使用上一节的 `diff` 命令，理解为什么修改 YAML 后需要构建。
+
+### 实验四：查看当前参数
+
+节点运行时：
+
+```bash
+ros2 param get /chassis_can_node transport
+ros2 param get /chassis_can_node serial_port
+ros2 param get /chassis_can_node command_rate_hz
+```
+
+确认 YAML 已经进入第 1、2、4 模块。
+
+### 实验五：查看 launch 的最终结果
+
+```bash
+ros2 node info /chassis_can_node
+```
+
+你会看到第 8 模块启动后，第 1 模块创建的订阅、发布和服务接口。
+
+## 24. 最需要记住的几个区别
+
+### `package.xml` 与 `setup.py`
+
+```text
+package.xml：ROS 视角的包信息和依赖
+setup.py：Python/setuptools 视角的安装规则和入口
+```
+
+### `setup.py` 与 `setup.bash`
+
+```text
+setup.py：源码中的 Python 安装说明
+setup.bash：构建后生成的 Shell 环境脚本
+```
+
+二者名字相似，但用途完全不同。
+
+### `ros2 run` 与 `ros2 launch`
+
+```text
+ros2 run：直接运行一个可执行入口
+ros2 launch：按 launch 文件启动，并加载 YAML 等配置
+```
+
+当前串口版应使用 launch。
+
+### `src` 与 `install`
+
+```text
+src：你修改的源文件
+install：ROS 运行时查找的安装结果
+```
+
+### 构建与启动
+
+```text
+colcon build：安装/更新程序
+ros2 launch：运行已经安装的程序
+```
+
+### 节点启动与电机使能
+
+```text
+节点启动：通信和 ROS 接口开始工作
+电机使能：允许新鲜 /cmd_vel 变成有效运动命令
+```
+
+启动节点不等于电机会转。
+
+## 25. 当前工程的最短正确操作流程
+
+### 修改了 Python、YAML 或 launch 后
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/stop_chassis_serial_safe.sh
+cd ~/chassis_project/ros2_ws
+source /opt/ros/humble/setup.bash
+colcon build --packages-select chassis_can_control
+source install/setup.bash
+bash src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+### 没有修改，只是日常使用
+
+```bash
+pgrep -af 'chassis_serial.launch.py|chassis_can_node'
+```
+
+如果未运行：
+
+```bash
+bash ~/chassis_project/ros2_ws/src/chassis_can_control/scripts/start_chassis_serial_safe.sh
+```
+
+如果已经运行，不要再次启动。加载环境后直接查看：
+
+```bash
+source /opt/ros/humble/setup.bash
+source ~/chassis_project/ros2_ws/install/setup.bash
+ros2 topic echo --once /diagnostics
+```
+
+## 26. 总结：用一句话理解每个文件
+
+```text
+package.xml
+    告诉 ROS：我是谁、我依赖谁、我用 ament_python 构建。
+
+setup.py
+    告诉 Python：安装哪些模块、数据文件，以及哪个函数是程序入口。
+
+setup.cfg
+    告诉 setuptools：把 ROS 可执行入口放到包的 lib 目录。
+
+resource/chassis_can_control
+    在 ament 索引中登记这个包。
+
+__init__.py
+    让代码目录成为可以 import 的 Python 包。
+
+chassis_serial.yaml
+    提供串口、控制、几何、坐标和安全参数。
+
+chassis_serial.launch.py
+    找到安装后的 YAML，并启动正确的节点入口。
+
+start_chassis_serial_safe.sh
+    按正确顺序 source 环境、显示串口并前台 launch。
+
+stop_chassis_serial_safe.sh
+    先请求软件失能，再停止节点。
+```
+
+整个模块最核心的主线是：
+
+```text
+package.xml + setup.py
+        ↓ colcon build
+install 目录 + setup.bash
+        ↓ source
+launch + YAML
+        ↓
+console_scripts 入口
+        ↓
+chassis_can_node.py:main()
+        ↓
+前 1～7 个模块开始运行
+```
