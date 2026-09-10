@@ -6,7 +6,7 @@
 
 当前主线：`keil_project/R550_C30D_SERIAL_MOTOR/USER/WHEELTEC.uvprojx`，目标 `C30D_SERIAL_MOTOR`；ROS 源码在 `ros2_ws/src/chassis_can_control`。保留 CAN 工程，但它不是与串口主线同步的最新版 IMU 工程。不要直接以旧 releases、historical_builds 或 GD32 工程覆盖当前主线。
 
-现状：串口电机闭环曾有历史实车记录；IMU 采集、500点标定、ROS 发布、固定权重 yaw 融合已经有源码及历史软件验证记录；最新 IMU 的当前实车运行状态未在本次交接中验证。文档25中的时间戳、完整 gyro 积分、在线偏置、自适应融合、EKF/ESKF、舵角反馈均是建议方案，尚未实施。用户本次仅要求交接包，不代表已选择或授权某个算法升级方案。
+现状（2026-09-10更新）：串口电机闭环曾有历史实车记录；IMU 采集、500点标定及 ROS 发布已有实现。用户已授权并新增 Python 五状态平面 EKF，串口 YAML 默认 odometry.mode=ekf；weighted 保留原固定权重方式，CAN YAML 仍为 weighted。EKF 状态为 x/y/yaw/v/omega，不含在线 gyro bias；每个有效 IMU 对只更新一次，使用上位机接收时间。发布纯编码器 wheel/odom_raw 与 EKF odom，仅后者发布 TF。详见 docs/27；离线数学与节点替身测试不等于 ROS Humble 或实车验收。MCU 时间戳、在线偏置、ESKF、舵角反馈仍未实现。文档21～25中“当前算法”属于历史版本描述。
 
 约束：保持软件电机使能默认关闭；保留蜂鸣器关闭状态。写硬件前核对实际连接板、当前固件及备份；历史Flash和选项字节不是通用固件。不要把本包称为 RDK SD 卡或虚拟机完整镜像。不要根据过时 IP、旧账号或旧设备路径直接连接并启动电机。
 

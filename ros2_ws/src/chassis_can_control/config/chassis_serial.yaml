@@ -14,6 +14,19 @@ chassis_can_node:
     right_joint_name: right_wheel_joint
     push_parameters_on_start: false
 
+    # ekf 为新主线；weighted 可回到原固定权重算法。修改后重启节点。
+    odometry.mode: ekf
+    # 下面是尚待实车标定的起点，不代表已测得的传感器精度。
+    ekf.acceleration_noise: 0.8
+    ekf.angular_acceleration_noise: 2.0
+    ekf.wheel_speed_stddev: 0.04
+    ekf.wheel_yaw_rate_stddev: 0.15
+    ekf.gyro_stddev: 0.03
+    ekf.innovation_gate: 5.0
+    ekf.max_gap_s: 0.5
+    ekf.max_wheel_speed_mps: 2.0
+    ekf.max_yaw_rate_radps: 10.0
+
     # IMU 默认轴向假设：芯片 x/y/z 与 ROS base_link x/y/z 同向。
     # 第一次实车测试必须按操作文档验证 z 轴正方向，必要时把 z_sign 改为 -1.0。
     imu.frame_id: base_link
