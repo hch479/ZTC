@@ -22,6 +22,7 @@ from .can_protocol import CanFrame, EncoderData, MotorOutput, StatusData, WheelS
 from .socketcan_transport import SocketCanTransport
 from .serial_transport import SerialTransport
 from .wheel_odometry import OdometrySample, WheelOdometry
+from .planar_ekf import EkfConfig, EkfOdometry
 
 
 @dataclass

@@ -113,12 +113,21 @@ static void imu_task_run(uint8_t sensor_type)
 
                 if (calibration_samples >= IMU_CALIBRATION_SAMPLES)
                 {
-                    imu.Deviation_accel.x = (int16_t)(accel_sum_x / IMU_CALIBRATION_SAMPLES);
-                    imu.Deviation_accel.y = (int16_t)(accel_sum_y / IMU_CALIBRATION_SAMPLES);
-                    imu.Deviation_accel.z = (int16_t)(accel_sum_z / IMU_CALIBRATION_SAMPLES);
-                    imu.Deviation_gyro.x = (int16_t)(gyro_sum_x / IMU_CALIBRATION_SAMPLES);
-                    imu.Deviation_gyro.y = (int16_t)(gyro_sum_y / IMU_CALIBRATION_SAMPLES);
-                    imu.Deviation_gyro.z = (int16_t)(gyro_sum_z / IMU_CALIBRATION_SAMPLES);
+                    /*
+                     * Both operands MUST be signed. The sample-count macro is
+                     * 500U (unsigned). Dividing a negative signed sum by 500U
+                     * first converts the sum to unsigned on this MCU!
+                     * Example: -4000 / 500U becomes 8589926, then 4710 after
+                     * conversion to int16_t, instead of the correct -8.
+                     * Casting AFTER division is too late; cast the divisor.
+                     * 500 int16_t samples fit safely in an int32_t sum.
+                     */
+                    imu.Deviation_accel.x = (int16_t)(accel_sum_x / (int32_t)IMU_CALIBRATION_SAMPLES);
+                    imu.Deviation_accel.y = (int16_t)(accel_sum_y / (int32_t)IMU_CALIBRATION_SAMPLES);
+                    imu.Deviation_accel.z = (int16_t)(accel_sum_z / (int32_t)IMU_CALIBRATION_SAMPLES);
+                    imu.Deviation_gyro.x = (int16_t)(gyro_sum_x / (int32_t)IMU_CALIBRATION_SAMPLES);
+                    imu.Deviation_gyro.y = (int16_t)(gyro_sum_y / (int32_t)IMU_CALIBRATION_SAMPLES);
+                    imu.Deviation_gyro.z = (int16_t)(gyro_sum_z / (int32_t)IMU_CALIBRATION_SAMPLES);
 
                     /* The next driver read will subtract these offsets. */
                     SysVal.Time_count = CONTROL_DELAY;

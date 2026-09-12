@@ -26,3 +26,11 @@ target_link_libraries(chassis_core_tests PRIVATE chassis_core m)
 enable_testing()
 add_test(NAME chassis_core_tests COMMAND chassis_core_tests)
 
+# Test the real serial Keil IMU task with host-side sensor/RTOS substitutes.
+add_executable(imu_calibration_tests tests/test_imu_calibration.c)
+target_include_directories(imu_calibration_tests PRIVATE
+    keil_project/R550_C30D_SERIAL_MOTOR/HARDWARE/MPU6050
+    keil_project/R550_C30D_SERIAL_MOTOR/HARDWARE/ICM20948
+)
+add_test(NAME imu_calibration_tests COMMAND imu_calibration_tests)
+
